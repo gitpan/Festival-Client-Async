@@ -6,9 +6,9 @@
 # Change 1..1 below to 1..last_test_to_print .
 # (It may become useful if the test is moved to ./t subdirectory.)
 
-BEGIN { $| = 1; print "1..10\n"; }
+BEGIN { $| = 1; print "1..12\n"; }
 END {print "not ok 1\n" unless $loaded;}
-use Festival::Client::Async;
+use Festival::Client::Async qw(parse_lisp);
 use IO::Select;
 $loaded = 1;
 print "ok 1\n";
@@ -83,6 +83,10 @@ $c->server_eval(<<EOL);
   (utt.send.wave.client utt))
 EOL
 
+$c->server_eval('(+ 2 2)');
+$c->server_eval(q((mapcar (lambda (x) (/ x 5)) '(5 10 15 23))));
+$c->server_eval(q/'(")\"()()())("(foo))/);
+
 EVENT:
 while (1) {
     if ($s->can_write) {
@@ -100,13 +104,16 @@ while (1) {
 	}
 	if ($c->lisp_pending) {
 	    while (defined(my $l = $c->dequeue_lisp)) {
-		chomp($l);
+		$l = parse_lisp($l);
 		print "ok 8\n" if $l =~ /#<Utterance/;
+		print "ok 9\n" if $l == 4;
+		print "ok 10\n" if ref($l) and @$l == 4;
+		print "ok 11\n" if ref($l) and $l->[0] eq '")\"()()())("';
 	    }
 	}
 	if ($c->ok_pending) {
 	    while (defined(my $o = $c->dequeue_ok)) {
-		print "ok 9\n";
+		# print "ok 9\n";
 	    }
 	    last EVENT;
 	}
@@ -120,8 +127,8 @@ while (1) {
 
 close TMP;
 if (system('cmp', 'hello.raw', 'hello.tmp.raw') == 0) {
-    print "ok 10\n";
+    print "ok 12\n";
 } else {
-    print "not ok 10\n";
+    print "not ok 12\n";
 }
 unlink 'hello.tmp.raw';

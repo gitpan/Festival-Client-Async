@@ -18,26 +18,41 @@ BEGIN {
     }
 };
 
-use vars qw($VERSION);
-$VERSION = 0.03_01;
+use vars qw($VERSION @ISA @EXPORT_OK);
+$VERSION = 0.03_03;
+@ISA = qw(Exporter);
+@EXPORT_OK = qw(parse_lisp);
 
-sub block {
-    my $fh = shift;
-    my $flags = 0;
-    fcntl $fh, F_GETFL, $flags
-	or die "fcntl(F_GETFL) failed: $!";
-    fcntl $fh, F_SETFL, $flags & ~O_NONBLOCK
-	or die "fcntl(F_SETFL) failed: $!";
+sub parse_lisp {
+    my $lisp = shift;
 
-}
+    my (@stack, $top);
+    $top = [];
+    @stack = ($top);
+    while ($lisp =~ m{(
+		       [()]
+		      |
+		       "(?:[^"\\]+|\\.)*"
+		      |
+		       \#<[^>]+>
+		      |
+		       [^()\s]+
+		       )}xg) {
+	my $tok = $1;
+	if ($tok eq '(') {
+	    my $newtop = [];
+	    push @$top, $newtop;
+	    push @stack, ($top = $newtop);
+	} elsif ($tok eq ')') {
+	    pop @stack;
+	    $top = $stack[-1];
+	    die "stack underflow" unless defined $top;
+	} else {
+	    push @$top, $tok;
+	}
+    }
 
-sub unblock {
-    my $fh = shift;
-    my $flags = 0;
-    fcntl $fh, F_GETFL, $flags
-	or die "fcntl(F_GETFL) failed: $!";
-    fcntl $fh, F_SETFL, $flags | O_NONBLOCK
-	or die "fcntl(F_SETFL) failed: $!";
+    return $top->[0];
 }
 
 sub new {
@@ -51,28 +66,50 @@ sub new {
 				  PeerPort  => $port || 1314)
 	or return undef;
     binmode $s;
-    unblock $s;
 
-    bless {
-	   sock => $s,
-	   outbuf => "",
-	   outq => {
-		    LP => [],
-		   },
-	   intag => "",
-	   inbuf => "",
-	   inq => {
-		   LP => [],
-		   WV => [],
-		   OK => [],
-		   ER => [],
-		  },
-	  };
+    my $self = bless {
+		      blocked => 0,
+		      sock => $s,
+		      outbuf => "",
+		      outq => {
+			       LP => [],
+			      },
+		      intag => "",
+		      inbuf => "",
+		      inq => {
+			      LP => [],
+			      WV => [],
+			      OK => [],
+			      ER => [],
+			     },
+		     }, $class;
+    $self->unblock;
+    return $self;
 }
 
 sub fh {
     my $self = shift;
     return $self->{sock};
+}
+
+sub block {
+    my $self = shift;
+    my $flags = 0;
+    fcntl $self->{sock}, F_GETFL, $flags
+	or die "fcntl(F_GETFL) failed: $!";
+    fcntl $self->{sock}, F_SETFL, $flags & ~O_NONBLOCK
+	or die "fcntl(F_SETFL) failed: $!";
+    $self->{blocked} = 1;
+}
+
+sub unblock {
+    my $self = shift;
+    my $flags = 0;
+    fcntl $self->{sock}, F_GETFL, $flags
+	or die "fcntl(F_GETFL) failed: $!";
+    fcntl $self->{sock}, F_SETFL, $flags | O_NONBLOCK
+	or die "fcntl(F_SETFL) failed: $!";
+    $self->{blocked} = 0;
 }
 
 # Protocol encoding
@@ -88,10 +125,12 @@ sub write_more {
 
     my $count;
     while (defined(my $b = syswrite($self->{sock}, $self->{outbuf}, 4096))) {
+	print "wrote $b bytes\n" if DEBUG;
 	last if $b == 0;
 
 	$count += $b;
 	substr($self->{outbuf}, 0, $b) = "";
+	last if $self->{blocked} and $b < 4096;
     }
 
     return $count;
@@ -125,16 +164,34 @@ sub read_more {
 		    $count += $i;
 		}
 	    } else {
-		# It's all data to be queued
+		# Maybe we got *part* of the stuff key at the end of
+		# this block.  Stranger things have happened.
+		my $leftover = "";
+	    PARTIAL:
+		for my $sub (1..KEYLEN-1) {
+		    my $foo = \substr($self->{inbuf}, -$sub);
+		    my $bar = substr(KEY, 0, $sub);
+		    if ($$foo eq $bar) {
+			$$foo = "";
+			$leftover = $bar;
+			last PARTIAL;
+		    }
+		}
+
+		# In any case we don't have any more data
 		push @{$self->{inq}{$self->{intag}}}, $self->{inbuf};
 		print "queued ", length($self->{inbuf}), " bytes of $self->{intag}\n"
 		    if DEBUG;
 		$count += length($self->{inbuf});
-		$self->{inbuf} = "";
+		$self->{inbuf} = $leftover;
+
+		# But don't keep looping if we left some stuff in there!
+		last CHUNK if $leftover;
 	    }
 	} else {
 	    if ($self->{inbuf} =~ s/^(WV|LP|ER|OK)\n//) {
 		print "got tag $1\n" if DEBUG;
+		$count += length($1);
 		# We got a tag, so a new type of data is coming
 		if ($1 eq 'OK') {
 		    push @{$self->{inq}{OK}}, time;
@@ -154,11 +211,39 @@ sub read_more {
     return $count;
 }
 
-# Don't mix this with async operations :(
 sub server_eval_sync {
     my ($self, $lisp, $actions) = @_;
+    $self->block;
+    $self->server_eval($lisp);
+
+    unless ($self->write_more) {
+	$self->unblock;
+	return undef;
+    }
+    while ($self->read_more) {
+	while (defined(my $wav = $self->dequeue_wave)) {
+	    $actions->{WV}->($wav) if exists $actions->{WV};
+	}
+	while (defined(my $lisp = $self->dequeue_lisp)) {
+	    $actions->{LP}->($lisp) if exists $actions->{LP};
+	}
+	if (defined($self->dequeue_error)) {
+	    $self->unblock;
+	    return undef;
+	}
+	if (defined($self->dequeue_ok)) {
+	    last;
+	}
+    }
+    $self->unblock;
+    return 1;
+}
+
+# Don't mix this with async operations :(
+sub server_eval_sync_old {
+    my ($self, $lisp, $actions) = @_;
     my $fh = $self->{sock};
-    block($fh);
+    $self->block;
 
     local $|=1;
 
@@ -185,7 +270,7 @@ sub server_eval_sync {
 	}
     }
 
-    unblock($fh);
+    $self->unblock;
     return defined($tag) && ($tag eq 'OK');
 }
 
@@ -248,6 +333,8 @@ Festival::Client::Async - Non-blocking interface to a Festival server
 
 =head1 SYNOPSIS
 
+  use Festival::Client::Async qw(parse_lisp);
+
   my $fest = Festival::Client::Async->new($host, $port);
   $fest->server_eval_sync($lisp, \%actions); # blocking
   $fest->server_eval($lisp); # just queues $lisp for writing
@@ -268,7 +355,8 @@ Festival::Client::Async - Non-blocking interface to a Festival server
       # Do something with it
   }
   while ($fest->lisp_pending) {
-      my $lisp = $fest->dequeue_lisp;
+      my $lisp = $fest->dequeue_lisp
+      my $arr = parse_lisp($lisp);
 
       # Do something with it
   }
@@ -354,6 +442,20 @@ an empty line. (Note: I'm not sure if this is actually guaranteed
 anywhere in the Festival code, and you can probably get it rather
 confused if you embed newlines in strings and such.  Just Don't Do
 That.)
+
+C<Festival::Client::Async> exports (or rather, can export - you will
+have to specify it explicitly in the C<use> statement) one subroutine,
+C<parse_lisp>, which is a convenience function for de-lisp-ifying
+results sent back from Festival.  It tries its best to create Perl
+data structures approximating the Lisp ones spat out by Festival.
+Symbols, numbers, and strings are all converted to scalars, while
+lists are turned into arrays.  For example,
+
+  ((foo 123) ("bar" "baz") ())
+
+will be parsed as:
+
+  [["foo" 123] ["bar" "baz"] []]
 
 =item Waveform data
 
